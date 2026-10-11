@@ -213,6 +213,129 @@ macOS NVRM.kext = Linux NVRM 内核代码 + XNU 内核适配层
 
 这是「NVIDIA 官方开源 + 社区移植」的组合：使用的是同一套经过验证的内核驱动逻辑，只是把它移植到 macOS 内核，并搭配匹配版本的 GSP 固件。
 
+## NVRM.kext 源码级拆解（`kexts/NVRM/`）
+
+该目录约 14.7k 行（66 个文件），是整个项目技术密度最高的部分。一句话概括：**NVRM.kext 是 NVIDIA 官方 Linux 开源内核模块（r610）与 macOS XNU 内核之间的适配壳**。它不自己实现显卡逻辑，而是把 NVIDIA RM（Resource Manager）代码直接编译进来，再补齐 RM 在 Linux 上依赖、macOS 没有的那批 `os_*` 函数。
+
+`nv-xnu.h` 直接引入 NVIDIA 的头文件，说明这是 hard-fork 式移植：
+
+```c
+#define NVRM 1
+#include "cpuopsys.h"          // NVIDIA 的 OS 抽象接口声明
+#include "nv.h"                // RM 主头
+#include "os-interface.h"
+#include "nv-kernel-rmapi-ops.h"
+#undef NVRM
+```
+
+链接时使用 `libnvkernel.a` / `libnvkms.a`（`rmcc.py` 中即写明 "kext links it beside libnvkernel.a"）。
+
+### 目录内容分类
+
+| 类别 | 文件 |
+|---|---|
+| IOKit 粘合（主驱动） | `NVRM.cpp`(1326)、`nv-xnu.h` |
+| OS 抽象实现 | `os-xnu.cpp`(301)、`os-xnu2.cpp`(1396) |
+| Linux 缺失符号的弱桩 | `nv_xnu_stubs.cpp`(1815) |
+| 直连 RM 内部的功能 | `nvrm_gpuva.cpp`、`nvrm_surfshare.cpp`、`nvrm_pageoff.c`、`nvrm_fbinfo.cpp`、`nvrm_kapi_fields.c` |
+| KMS / 显示 | `os-nvkms-xnu.cpp`(371)、`nvkms_shaders.cpp`(1381)、`nvidia-modeset-os-interface.h` |
+| 子 kext | `accel/`、`fb/`、`agdc/` |
+| 构建/补丁 | `build-completion-archive.py`、`rmcc.py`、`patches/610-display-completion.patch` |
+| 用户态工具（**不属于 kext**） | `kms.inc`、`push.inc`、`mirror.inc` |
+
+> 层次上的小毛病：`.inc` 这三份是用户态测试程序（用了 `printf`、`IOConnectCallMethod`、`Foundation`/`IOSurface`），却放在 kext 源码目录里。
+
+### NVRM.cpp —— IOKit 粘合层
+
+`NVRM : IOService`，`IOUserClientClass = NVRMUserClient`。
+
+**匹配与启动**
+- `probe()`：先按 boot-arg / `nullmoth-remove` 判断驱动是否已被要求关闭（`nvrm_driver_off`），再调 NVIDIA 自己的 `rm_is_supported_pci_device()` 决定认不认这张卡。
+  - Info.plist 故意用**宽匹配**（vendor `0x10DE` + class `0x03`），真正的闸门交给 RM——注释写明 "a mask match is a WIDE net ON PURPOSE"。
+- `start()`：读 PCI 信息 → `snapshotBootScreen()` 拷贝开机控制台画面 → `placeLargeBar1()` → `readBARs()` → 建 client 表 → 启动 `autoGo` 线程。
+
+**两趟 bring-up（`go(pass)`）**
+
+```
+pass 1: rm_init_rm → rm_init_event_locks → rm_is_supported_device
+        → rm_init_private_state → rm_set_rm_firmware_requested
+pass 2: setBusMasterEnable → 找 MSI → 建 IOWorkLoop + 中断源
+        → rm_init_adapter  ← GSP 固件在这一步真正启动
+        → 查询 VRAM → nvkms_xnu_load() → 发布 NVRMDisplay nub
+```
+
+`rm_init_adapter` 就是那句 "GSP boot from inside macOS"。
+
+**关键机制**
+
+- **Boot hold（启动闸门）**：`start()` 里 `adjustBusy(1)` 把 IORegistry 标记为 busy，挡住 WindowServer 的 `IOKitWaitQuiet`，直到显示栈就绪才 `releaseBootHold`；另有 `bootHoldCap` 定时器（settle + 40s）兜底。解决"显示还没 armed 就被 WindowServer 抢走"的竞态。
+- **BAR1 放置 + Resizable BAR**（最硬核的一段）：读 PCIe Resizable BAR capability，若 BAR1 < 4GB 则尝试放大到 4/8GB（16GB 会启动失败，8GB 经硬件验证）；从 ACPI `_CRS` 解析 host bridge 的 64 位内存窗口，用 CPUID `MAXPHYADDR` 裁剪；要求父桥是 **Root Port**（eGPU/Thunderbolt 直接放弃）；检查区间不与任何其他 PCI 设备/桥窗口重叠；写 BAR、改根端口窗口、**回读校验**，不一致就回滚。
+- **自动 bring-up 线程 `autoGo`**：延时（默认 10s，BAR1 放不下时 100s）→ `measureBootRaster()`（直接读 GPU 寄存器 `0x616330` 测刷新率）→ `go(2)` → 轮询 `debug.nvaccel_heads_published` → 依次打开 `debug.nvaccelfb` / `nvrmfb_agdc` / `nvaccel_iop` → 释放 boot hold。整套由 sysctl 驱动的状态机。
+- **中断**：`IOFilterInterruptEventSource` + MSI，`interruptOccurred` 调 RM 的 `rm_isr` / `rm_isr_bh`，用 `nv_xnu_isr_thread` 标记 ISR 上下文（`os_is_isr()` 依赖它）。
+
+**NVRMUserClient —— 用户态接口**
+- client 表 `gNvClients[32768]`，按 pid+fd 查找。
+- external methods：`go / esc / getfd / bindfd / kms / kmsevents / waitevent`。
+- `esc` 基本是把 ioctl **透传**给 `rm_ioctl`（另有 CARD_INFO / 版本检查 / surface share 特殊处理）。
+- `clientMemoryForType` 实现 mmap：控制设备走 `nv_xnu_alloc_md` 子区间，设备端走 `nv_pm_is_gpu` 校验后的物理区间（少数明确的安全检查，防止用户态映射任意内核内存）。
+- 事件：自研 `nv_post_event` → `thread_wakeup`，`sWaitEvent` 用 `assert_wait_timeout`。RM 官方事件机制在 XNU 上不存在，因此重写了一套。
+
+### OS 抽象层（移植工作量的主体）
+
+- **`os-xnu.cpp`**：基础原语——内存 `kern_os_malloc`、锁（`IOLock` / `IOSimpleLock` / `IORWLock` / Mach semaphore）、时间 `mach_absolute_time`、PCI handle、`os_map_kernel_space`、in/out 端口（裸 `inb/outb`）、环形日志。`os_get_cpu_count()` **硬编码返回 4**，`os_get_cpu_number()` 返回 0。
+- **`os-xnu2.cpp`**（1396 行）：DMA、内核映射、firmware、work item、wait queue，以及一大坨**内存分配追踪**（`nv_xnu_live`、`nv_q_*`、`nv_pm_*`）。后者维护"物理页 → 归属进程/状态"表，检测 stale 映射和泄漏，说明这块曾出现难查的内存 bug。
+- **`nv_xnu_stubs.cpp`**（1815 行）：**全是 `__attribute__((weak))` 空桩**，返回失败 / no-op，覆盖 ACPI 方法、Tegra 时钟、I2C、dma-buf、IMP、SMMU、电源等。这是"把 Linux/Tegra 专属依赖整体挖空"的做法，链接时可被真正的实现覆盖。
+
+固件加载在 `os-xnu2.cpp`：
+
+```c
+#define NV_FIRMWARE_FOR_NAME(name) "/Users/Shared/nvfw/nvidia/610.57.04/" name ".bin"
+// nv_get_firmware(): vnode_open + vn_rdwr 把 gsp_ga10x / gsp_tu10x / ucodes 读进内存
+```
+
+只认 GA10x/AD10x/GH100/GB/GR 和 TU10x/TU11x/GA100 两族，版本号硬编码在路径里。
+
+### 直连 RM 内部的功能模块
+
+这些绕过公开接口，直接调 NVIDIA 的 `rm_kernel_rmapi_op()` / 内部结构体：
+
+| 文件 | 作用 |
+|---|---|
+| `nvrm_gpuva.cpp` | 用 `NV04_ALLOC` 建 `FERMI_VASPACE_A` + `NV50_MEMORY_VIRTUAL`，`NV04_MAP_MEMORY_DMA` 做映射，给 NVK/accel 提供 GPU 虚拟地址 |
+| `nvrm_surfshare.cpp` | `NV04_SHARE` 共享对象；page-off 走 CE |
+| `nvrm_pageoff.c` | **直接用 RM 内部 `memdesc*` / `ceutilsMemcopy`**，把 GPU 显存内容拷到一组物理页（合成器取帧用）；带 run 合并优化和 sysctl 统计 |
+| `nvrm_fbinfo.cpp` | 建 root client → `GPU_ATTACH_IDS` → `DEVICE_0` → `SUBDEVICE_0` → `FB_GET_INFO_V2` 查 VRAM |
+| `nvrm_kapi_fields.c` | 读取 `NvKmsKapiDevice/Memory` 里的 RM handle |
+
+`rmcc.py` 证实了这点：它从 NVIDIA 自己的 `compile_cmds.sh` 里抠出编译 `osapi.c` 的完整命令行，替换源文件来编译这些"内部文件"——必须与 RM 看到的结构体布局完全一致。
+
+### 显示（KMS）路径
+
+- `os-nvkms-xnu.cpp`：`nvKmsModuleLoad` / `nvKmsOpen/Close/Ioctl`、NVKMS 定时器队列、每 open 的 `nvkms_per_open`、内核态事件回调。
+- `nvkms_shaders.cpp`：**内嵌 NVIDIA `nvidia-modeset` 的 xz 压缩二进制 shader blob**（cursor/合成用）。
+- `patches/610-display-completion.patch`：给 `libnvkms.a` 打补丁，新增 `getFlipPendingStatus`（查询翻转是否完成），并用 `nvKmsResetNotifier` 重置 notifier 槽位；`build-completion-archive.py` 只替换 completion 对象后重打包 `libnvkms.a`。
+
+### 三个子 kext
+
+- **`accel/`（NVAccel）**：实现 `IOGraphicsAccelerator2`，WindowServer 合成走这里。Info.plist 声明 `MetalPluginName = /Library/GPUBundles/NVMTLDriver`、`MetalPluginClassName = NVMTLDevice`——这是 Metal 插件与内核加速器的连接点。`tahoe_fwd.h`（"macOS 26：继承 Apple 不再导出的槽位"）说明在适配新系统 vtable 变化。
+- **`fb/`（NVRMFB）**：`NVRMNVDAFramebuffer : IOFramebuffer`，provider 是 `NVRMDisplay` nub；另有 `NVRMFBClaim`（probe 30000）**挤掉 Apple 的 `IONDRVFramebuffer`**。
+- **`agdc/`（NVRMAGDC）**：`AppleGraphicsDeviceControl` 兼容层（`NVDAGDCLoader` on IOResources），用 `#pragma pack` + `static_assert` 严格对齐 Apple 私有结构体 `NVAGDCVendorInfo(0x2c)`、`NVAGDCGPUCapability(0xdc)`。
+
+### 代码质量与风险
+
+**做得扎实的地方**
+- BAR1 放置有完整的"先验证、写、回读、失败回滚"流程。
+- 内存映射有 `nv_pm_is_gpu` 白名单，避免用户态映射内核内存。
+- 大量 weak 桩让 Linux 专属依赖优雅降级。
+- 错误路径普遍有日志和状态回写。
+
+**脆弱 / 风险点**
+1. **深度耦合 NVIDIA 内部未稳定接口**（`rm_kernel_rmapi_op`、`memdesc*`、`ceutils*`、`NvKmsKapi` 内部字段）→ 必须锁死 `610.57.04`，换版本几乎必然重编/重打补丁。
+2. **硬编码寄存器偏移**：`measureBootRaster` 的 `0x616330`、`0x682064`，`nvrm_fbinfo.cpp` 的 class id `0x90f1`/`0x50a0` 等，均为逐芯片推断的魔法值。
+3. **硬编码常量**：固件路径版本号、`os_get_cpu_count()=4`。
+4. **安全面**：kext 无签名（需关 SIP），userclient 的 `esc` 直接透传 ioctl 给 RM，attack surface 很大；`os_check_access()` 直接 `return NV_TRUE`。
+5. **调试代码密度极高**：`kprintf`、sysctl、`nv_xnu_chat()` 开关、live alloc dump、pmap owner 表——典型的逆向/调试驱动形态，RELEASE 版才会剥掉。
+
 ## 数据流
 
 1. **应用提交**：
