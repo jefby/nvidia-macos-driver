@@ -336,6 +336,135 @@ pass 2: setBusMasterEnable → 找 MSI → 建 IOWorkLoop + 中断源
 4. **安全面**：kext 无签名（需关 SIP），userclient 的 `esc` 直接透传 ioctl 给 RM，attack surface 很大；`os_check_access()` 直接 `return NV_TRUE`。
 5. **调试代码密度极高**：`kprintf`、sysctl、`nv_xnu_chat()` 开关、live alloc dump、pmap owner 表——典型的逆向/调试驱动形态，RELEASE 版才会剥掉。
 
+## 硬件拓扑
+
+驱动面对的不是「接口类型（PCIe / Thunderbolt / USB-C）」，而是四层硬件拓扑。以下每层都标注源码依据。
+
+### 1. 主机侧 PCIe 拓扑
+
+**原生（源码按此实现，也是 RTX 5060 实测场景）**
+
+```
+CPU（含 Root Complex）
+  ├─ DMI ── PCH ── PCIe Root Port ──┐
+  └─ 或 CPU 直连 PCIe lane ── Root Port ──┐
+                                          │ PCIe x16
+                                   ┌──────▼──────┐
+                                   │  NVIDIA GPU │
+                                   └─────────────┘
+```
+
+**Thunderbolt / eGPU**
+
+```
+CPU ── Root Complex ── Root Port
+                         └─ Thunderbolt 控制器（NHI，PCIe 设备）
+                             └─ ~~~ TB 线缆 / USB-C 口 ~~~
+                                 └─ TB 外设内部 Downstream Port
+                                     └─ NVIDIA GPU
+```
+
+源码判断点（`kexts/NVRM/NVRM.cpp:760-771`）：从 GPU 沿 IORegistry 往上找**直接父桥**，读其 PCIe capability：
+
+- `port type == 4`（Root Port）→ 原生，允许重排 BAR1；
+- `port type != 4`（Thunderbolt / PCIe switch 的下游端口）→ 拒绝搬 BAR1。
+
+IOKit 中一个 PCIe 桥是两层对象，所以代码要向上找两层：
+
+```
+GPU（IOPCIDevice，NVRM 绑定这里）
+ └─ IOPCI2PCIBridge      ← fPCI->getProvider()（总线 nub）
+     └─ 父桥 IOPCIDevice  ← pp->getProvider()，检查其是否为 Root Port
+```
+
+> 纯 USB-C（无 Thunderbolt 隧道）不构成 PCIe 通道，显卡不会出现在 PCI 总线上。
+
+### 2. 显卡侧 GPU 内部拓扑
+
+源码通过 BAR0 直接读寄存器（`NVRM.cpp::nv_xnu_dump_gsp_regs`）：
+
+```
+┌──────────────────────── NVIDIA GPU 芯片 ────────────────────────┐
+│  ┌──────────────┐  mailbox   ┌────────────────────────────────┐  │
+│  │ GSP（RISC-V）│◄==========►│ host（macOS / NVRM.kext）       │  │
+│  │  + Falcon    │ 0x110040/44│ 经 BAR0 MMIO 寄存器通信         │  │
+│  │  （跑固件）   │ 0x110804/08└────────────────────────────────┘  │
+│  └──────┬───────┘                                               │
+│  ┌──────▼───────┐ ┌──────────┐ ┌───────────────────────────┐    │
+│  │ 显示引擎       │ │ 拷贝引擎  │ │ GPU MMU（页表 / gpuva）     │    │
+│  │ 0..3 共 4 head │ │ (CE)     │ │ 映射 VRAM / 系统内存        │    │
+│  └──────┬───────┘ └──────────┘ └───────────────────────────┘    │
+│  ┌──────▼──────────────────────────────┐                        │
+│  │ VRAM（显存，如 8 GB）                 │                        │
+│  └─────────────────────────────────────┘                        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+| 部分 | 依据 |
+|---|---|
+| GSP = RISC-V + Falcon | `PGSP_FALCON_*`（0x110040/44/80/08/3c0）、`GSP_RISCV_CPUCTL`（0x111388）、`PGSP_MAILBOX(0/1)`、`PGSP_QUEUE_HEAD` |
+| GSP 固件受保护内存 | `PFB_PRI_MMU_WPR2_ADDR_*`（0x1FA824/28） |
+| 4 个显示 head | `NVRM_MAX_HEADS 4`；`nvfbheads` boot-arg |
+| 拷贝引擎 | `nvrm_pageoff.c` 的 `ceutilsMemcopy` / `memdesc*` |
+| GPU MMU / gpuva | `nvrm_gpuva.cpp` 的 `FERMI_VASPACE_A` + `NV50_MEMORY_VIRTUAL` + `MAP_MEMORY_DMA` |
+
+### 3. 内存拓扑
+
+```
+        CPU 物理地址空间                          GPU 侧
+ ┌───────────────────────────┐          ┌───────────────────────┐
+ │ 系统 RAM                   │  DMA ───►│ GPU MMU               │
+ │                           │          │  gpuva ──► VRAM       │
+ │ BAR1 aperture（可放大到    │◄─窗口──  │        └► 系统 RAM     │
+ │   4/8 GB，映进 VRAM）       │          │                       │
+ │ BAR0（寄存器 MMIO，几 MB）  │          │ VRAM（显存）           │
+ │ BAR3（另一个 aperture）     │          │                       │
+ └───────────────────────────┘          └───────────────────────┘
+```
+
+- **BAR0** = 寄存器窗口（`NV_GPU_BAR_INDEX_REGS`）。
+- **BAR1** = 显存大窗口（`NV_GPU_BAR_INDEX_FB`），`placeLargeBar1()` 摆位并可放大到 8 GB。
+- **BAR3** = 另一个 64 位 aperture，与 BAR1 一起被搬。
+- 显存大小由 `nvrm_fbinfo.cpp` 的 `FB_GET_INFO_V2` 查出，发布为 `VRAM,totalsize`。
+- `nvrm_vram_abi.h` 的 `NVRM_VRAM_BAR1_BUDGET = 192 MB` 为经 BAR1 的显存分配预算。
+
+### 4. 显示输出拓扑
+
+```
+GPU 显示引擎 ── head 0 ── connector ── 显示器
+             ├─ head 1 ── connector ── 显示器
+             ├─ head 2 ── connector
+             └─ head 3 ── connector
+        │
+        └─ 扫描输出 → NVRMFB.kext（IOFramebuffer）+ NVRMAGDC.kext（显示策略）
+```
+
+- 每个 head 生成一个 `NVRMDisplay` nub，`NVRMFB.kext` 的 `NVRMNVDAFramebuffer` 匹配它。
+- `fb/nvrm-fb.cpp` 有 `fHead` / `fConnector` / `fDisplay`、`flipToMemory`、scanout。
+- `nvrm_vram_abi.h` 定义 `nvScanoutInfo`、`NVRMFlipRequest`（`nvFlipToSurface`）。
+
+### 5. 硬件资源到驱动接口的映射
+
+| 硬件资源 | 驱动如何使用 |
+|---|---|
+| BAR0 寄存器 | `IOMemoryDescriptor` 映射后读写（`os_map_kernel_space`） |
+| BAR1/BAR3 显存窗口 | `fPCI->setDeviceMemory()`，供 NVK/accel 使用 |
+| MSI 中断 | `IOFilterInterruptEventSource` → `rm_isr` |
+| GSP 通信 | BAR0 mailbox 寄存器 + 共享内存 + 中断 |
+| 显存/系统内存 DMA | GPU MMU（gpuva）+ host 侧 `IOMemoryDescriptor` |
+| 显示扫描 | `IOFramebuffer` + flip notifier |
+| GSP 固件文件 | `/Users/Shared/nvfw/nvidia/610.57.04/*.bin`（`nv_get_firmware`） |
+
+### 6. 实测与覆盖范围
+
+- **实测拓扑**：原生 PCIe Root Port + RTX 5060。
+- **识别但不完整**：Thunderbolt eGPU（RTX 3070 失败证据 `kbusVerifyBar2 NV_ERR_MEMORY_ERROR`），BAR1 不搬。
+- **不支持**：纯 USB-C（无 PCIe 隧道）、Apple Silicon、Pascal 及更早、Optimus 显示 mux。
+
+一句话：
+
+> CPU Root Complex → Root Port →（可选 Thunderbolt 桥链）→ NVIDIA GPU（内含 GSP RISC-V + 显示/拷贝引擎 + MMU + VRAM）→ 显示 connector。源码只对「Root Port 直连 GPU」链路做完整 BAR1 重排；Thunderbolt 链路会识别但退化为「用固件放好的 BAR1」。
+
 ## 数据流
 
 1. **应用提交**：
